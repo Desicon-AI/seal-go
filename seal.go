@@ -3,15 +3,20 @@ package seal
 import (
 	"bytes"
 	"encoding/json"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"sync"
 	"fmt"
 	"net/http"
-	"os"
 	"runtime/debug"
 	"strings"
 	"time"
 )
 
 type WafConfig struct {
+	TrustProxyHeaders bool
 	GeoBlocking       struct { BlockedCountries []string; Action string }
 	MaliciousScanners struct { Action string }
 	MethodTampering   struct { Action string }
@@ -21,6 +26,7 @@ type WafConfig struct {
 
 type Options struct {
 	APIKey      string
+	SigningSecret string
 	AppName     string
 	Environment string
 	Endpoint    string
@@ -32,6 +38,8 @@ var (
 	clientOptions Options
 	initialized   bool
 	startTime     int64
+	deliveryMu sync.RWMutex
+	lastHeartbeatOK bool
 )
 
 // Init initializes the Seal engine
@@ -66,13 +74,8 @@ func Init(opts Options) {
 		fmt.Println("[Seal] Warning: Missing API Key. Crashes will not be reported.")
 	}
 
-	// Ping to resolve old errors
-	go func() {
-		req, _ := http.NewRequest("POST", opts.Endpoint+"/ping", nil)
-		req.Header.Set("X-API-Key", opts.APIKey)
-		client := &http.Client{Timeout: 3 * time.Second}
-		client.Do(req)
-	}()
+	// Startup acknowledgements never imply incident recovery.
+	go sendAsyncPayload(auxiliaryEndpoint("/ping"), nil)
 
 	// Start Heartbeat Goroutine
 	go heartbeatLoop()
@@ -102,7 +105,10 @@ func sendHeartbeat() {
 		"started_at":  startTime,
 		"source":      "server_goroutine",
 	}
-	sendAsyncPayload(clientOptions.Endpoint+"/heartbeat", payload)
+	err := sendAsyncPayload(auxiliaryEndpoint("/heartbeat"), payload)
+	deliveryMu.Lock()
+	lastHeartbeatOK = err == nil
+	deliveryMu.Unlock()
 }
 
 // Recover is a middleware/defer wrapper to catch panics
@@ -147,7 +153,9 @@ func reportThreat(threatType, ip string, details map[string]interface{}, r *http
 		details = make(map[string]interface{})
 	}
 	details["method"] = r.Method
-	details["url"] = r.URL.String()
+	pathHash := sha256.Sum256([]byte(r.URL.Path))
+	details["path_hash"] = hex.EncodeToString(pathHash[:])
+	if _, ok := details["action"]; !ok { details["action"] = "observed" }
 
 	payload := map[string]interface{}{
 		"app_name":    clientOptions.AppName,
@@ -157,7 +165,7 @@ func reportThreat(threatType, ip string, details map[string]interface{}, r *http
 		"context":     details,
 	}
 
-	endpoint := strings.Replace(clientOptions.Endpoint, "/ingest", "/ingest/threat", 1)
+	endpoint := auxiliaryEndpoint("/threat")
 	go sendAsyncPayload(endpoint, payload)
 }
 
@@ -174,20 +182,52 @@ func RegisterDeployment(version string) {
 		"environment": clientOptions.Environment,
 	}
 
-	endpoint := strings.Replace(clientOptions.Endpoint, "/ingest", "/deployment", 1)
-	endpoint = strings.Replace(endpoint, "/api/v1/sandbox/deployment", "/api/v1/deployment", 1)
+	endpoint := auxiliaryEndpoint("/deployment")
 	go sendAsyncPayload(endpoint, payload)
 }
 
-func sendAsyncPayload(url string, payload map[string]interface{}) {
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", clientOptions.APIKey)
+// Auxiliary SDK routes live under /ingest, including for sandbox error reporters.
+func auxiliaryEndpoint(suffix string) string {
+    return strings.Replace(strings.TrimRight(clientOptions.Endpoint, "/"), "/sandbox/ingest", "/ingest", 1) + suffix
+}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	client.Do(req)
+func HeartbeatDeliveryOK() bool {
+    deliveryMu.RLock()
+    defer deliveryMu.RUnlock()
+    return lastHeartbeatOK
+}
+
+func sendAsyncPayload(url string, payload map[string]interface{}) error {
+    var jsonData []byte
+    var err error
+    if payload != nil {
+        jsonData, err = json.Marshal(payload)
+        if err != nil { return err }
+    }
+    req, err := http.NewRequest("POST", url, bytes.NewReader(jsonData))
+    if err != nil { return err }
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-API-Key", clientOptions.APIKey)
+    if clientOptions.SigningSecret != "" {
+        timestamp := fmt.Sprint(time.Now().Unix())
+        signature := hmac.New(sha256.New, []byte(clientOptions.SigningSecret))
+        signature.Write(append([]byte(timestamp + "."), jsonData...))
+        req.Header.Set("X-Seal-Timestamp", timestamp)
+        req.Header.Set("X-Seal-Signature", hex.EncodeToString(signature.Sum(nil)))
+    }
+    client := &http.Client{Timeout: 5 * time.Second}
+    response, err := client.Do(req)
+    if err != nil { return err }
+    defer response.Body.Close()
+    if response.StatusCode < 200 || response.StatusCode >= 300 {
+        return fmt.Errorf("telemetry HTTP %d", response.StatusCode)
+    }
+    if strings.HasSuffix(url, "/heartbeat") {
+        var ack struct { Status string `json:"status"` }
+        if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&ack); err != nil { return err }
+        if ack.Status != "ok" { return fmt.Errorf("heartbeat not acknowledged") }
+    } else {
+        io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+    }
+    return nil
 }
